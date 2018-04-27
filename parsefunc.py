@@ -10,7 +10,7 @@ LoadAttr   = namedtuple('LoadAttr', 'name')
 CallFunction = namedtuple('CallFunction', 'arity')
 ReturnValue = namedtuple('ReturnValue', '')
 LoadConst  = namedtuple('LoadConst', 'value')
-CompareOp  = namedtuple('CompareOp', 'op')
+Binop  = namedtuple('Binop', 'op')
 
 class UnrecognizedInstruction(Exception):
     pass
@@ -59,7 +59,11 @@ def tokenize(code):
             yield LoadConst(code.co_consts[arg])
         elif opname == 'COMPARE_OP':
             arg = scanner.get_short()
-            yield CompareOp(dis.cmp_op[arg])
+            yield Binop(dis.cmp_op[arg])
+        elif opname == 'BINARY_AND':
+            yield Binop('&')
+        elif opname == 'DUP_TOP':
+            yield Dup()
         else:
             raise UnrecognizedInstruction(opname)
 
@@ -114,9 +118,9 @@ def reconstruct(func):
             return stack.pop()
         elif isinstance(token, LoadConst):
             stack.append(expr.Const(token.value))
-        elif isinstance(token, CompareOp):
+        elif isinstance(token, Binop):
             left, right = _pop_n(stack, 2)
-            stack.append(expr.Compare(token.op, left, right))
+            stack.append(expr.Binop(token.op, left, right))
         else:
             assert False, "Unhandled token type: {}".format(token)
 
@@ -125,3 +129,4 @@ def reconstruct(func):
 
 assert reconstruct(example1) == expr.Call(expr.Global('f'), [expr.Call(expr.Global('g'), [expr.Arg('x')])])
 assert reconstruct(example2) == expr.GetAttr(expr.Arg('x'), 'r')
+assert reconstruct(lambda: a & b) == expr.Binop('&', expr.Global('a'), expr.Global('b'))
