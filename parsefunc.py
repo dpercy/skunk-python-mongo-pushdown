@@ -90,11 +90,11 @@ def _pop_n(stack, num):
     stack[-num:] = []
     return values
 
-def reconstruct(func):
+def reconstruct(func, args=None):
     code = func.func_code
 
     # list where each index is an AST representing that local or argument
-    local_vars = []
+    local_vars = list(args or [])
     for idx, name in enumerate(code.co_varnames):
         if idx < code.co_argcount:
             local_vars.append(expr.Arg(name))
