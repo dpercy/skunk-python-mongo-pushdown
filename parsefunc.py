@@ -3,10 +3,13 @@ import dis
 from collections import namedtuple
 
 # struct view of instructions
-LoadGlobal = namedtuple('LoadGlobal', 'index')
+LoadGlobal = namedtuple('LoadGlobal', 'name')
 LoadFast   = namedtuple('LoadFast', 'index')
+LoadAttr   = namedtuple('LoadAttr', 'name')
 CallFunction = namedtuple('CallFunction', 'arity')
 ReturnValue = namedtuple('ReturnValue', '')
+LoadConst  = namedtuple('LoadConst', 'value')
+CompareOp  = namedtuple('CompareOp', 'op')
 
 class UnrecognizedInstruction(Exception):
     pass
@@ -38,7 +41,10 @@ def tokenize(code):
         opname = dis.opname[opcode]
         if opname == 'LOAD_GLOBAL':
             arg = scanner.get_short()
-            yield LoadGlobal(arg)
+            yield LoadGlobal(code.co_names[arg])
+        elif opname == 'LOAD_ATTR':
+            arg = scanner.get_short()
+            yield LoadAttr(code.co_names[arg])
         elif opname == 'LOAD_FAST':
             arg = scanner.get_short()
             yield LoadFast(arg)
@@ -47,17 +53,30 @@ def tokenize(code):
             yield CallFunction(arg)
         elif opname == 'RETURN_VALUE':
             yield ReturnValue()
+        elif opname == 'LOAD_CONST':
+            arg = scanner.get_short()
+            yield LoadConst(code.co_consts[arg])
+        elif opname == 'COMPARE_OP':
+            arg = scanner.get_short()
+            yield CompareOp(dis.cmp_op[arg])
         else:
             raise UnrecognizedInstruction(opname)
 
 
 example1 = lambda x: f(g(x))
 assert list(tokenize(example1.func_code)) == [
-    LoadGlobal(index=0),
-    LoadGlobal(index=1),
+    LoadGlobal(name='f'),
+    LoadGlobal(name='g'),
     LoadFast(index=0),
     CallFunction(arity=1),
     CallFunction(arity=1),
+    ReturnValue()
+]
+
+example2 = lambda x: x.r
+assert list(tokenize(example2.func_code)) == [
+    LoadFast(index=0),
+    LoadAttr(name='r'),
     ReturnValue()
 ]
 
@@ -65,6 +84,9 @@ assert list(tokenize(example1.func_code)) == [
 Global = namedtuple('Global', 'name')
 Arg = namedtuple('Arg', 'name')
 Call = namedtuple('Call', 'func args')
+GetAttr = namedtuple('GetAttr', 'object name')
+Const = namedtuple('Const', 'value')
+Compare = namedtuple('Compare', 'op left right')
 
 def _pop_n(stack, num):
     values = stack[-num:]
@@ -73,12 +95,10 @@ def _pop_n(stack, num):
 
 def reconstruct(func):
     code = func.func_code
-    global_names = code.co_names
-    local_names = code.co_varnames
 
     # list where each index is an AST representing that local or argument
     local_vars = []
-    for idx, name in enumerate(local_names):
+    for idx, name in enumerate(code.co_varnames):
         if idx < code.co_argcount:
             local_vars.append(Arg(name))
         else:
@@ -87,15 +107,23 @@ def reconstruct(func):
     stack = [] # of ASTs
     for token in tokenize(code):
         if isinstance(token, LoadGlobal):
-            stack.append(Global(global_names[token.index]))
+            stack.append(Global(token.name))
         elif isinstance(token, LoadFast):
             stack.append(local_vars[token.index])
+        elif isinstance(token, LoadAttr):
+            obj = stack.pop()
+            stack.append(GetAttr(obj, token.name))
         elif isinstance(token, CallFunction):
             args = _pop_n(stack, token.arity)
             func = stack.pop()
             stack.append(Call(func, args))
         elif isinstance(token, ReturnValue):
             return stack.pop()
+        elif isinstance(token, LoadConst):
+            stack.append(Const(token.value))
+        elif isinstance(token, CompareOp):
+            left, right = _pop_n(stack, 2)
+            stack.append(Compare(token.op, left, right))
         else:
             assert False, "Unhandled token type: {}".format(token)
 
@@ -103,3 +131,4 @@ def reconstruct(func):
 
 
 assert reconstruct(example1) == Call(Global('f'), [Call(Global('g'), [Arg('x')])])
+assert reconstruct(example2) == GetAttr(Arg('x'), 'r')
