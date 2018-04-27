@@ -1,6 +1,7 @@
 
 import dis
 from collections import namedtuple
+import expr
 
 # struct view of instructions
 LoadGlobal = namedtuple('LoadGlobal', 'name')
@@ -80,14 +81,6 @@ assert list(tokenize(example2.func_code)) == [
     ReturnValue()
 ]
 
-# ASTs
-Global = namedtuple('Global', 'name')
-Arg = namedtuple('Arg', 'name')
-Call = namedtuple('Call', 'func args')
-GetAttr = namedtuple('GetAttr', 'object name')
-Const = namedtuple('Const', 'value')
-Compare = namedtuple('Compare', 'op left right')
-
 def _pop_n(stack, num):
     values = stack[-num:]
     stack[-num:] = []
@@ -100,35 +93,35 @@ def reconstruct(func):
     local_vars = []
     for idx, name in enumerate(code.co_varnames):
         if idx < code.co_argcount:
-            local_vars.append(Arg(name))
+            local_vars.append(expr.Arg(name))
         else:
             assert False, "TODO implement local variables?"
 
     stack = [] # of ASTs
     for token in tokenize(code):
         if isinstance(token, LoadGlobal):
-            stack.append(Global(token.name))
+            stack.append(expr.Global(token.name))
         elif isinstance(token, LoadFast):
             stack.append(local_vars[token.index])
         elif isinstance(token, LoadAttr):
             obj = stack.pop()
-            stack.append(GetAttr(obj, token.name))
+            stack.append(expr.GetAttr(obj, token.name))
         elif isinstance(token, CallFunction):
             args = _pop_n(stack, token.arity)
             func = stack.pop()
-            stack.append(Call(func, args))
+            stack.append(expr.Call(func, args))
         elif isinstance(token, ReturnValue):
             return stack.pop()
         elif isinstance(token, LoadConst):
-            stack.append(Const(token.value))
+            stack.append(expr.Const(token.value))
         elif isinstance(token, CompareOp):
             left, right = _pop_n(stack, 2)
-            stack.append(Compare(token.op, left, right))
+            stack.append(expr.Compare(token.op, left, right))
         else:
             assert False, "Unhandled token type: {}".format(token)
 
 
 
 
-assert reconstruct(example1) == Call(Global('f'), [Call(Global('g'), [Arg('x')])])
-assert reconstruct(example2) == GetAttr(Arg('x'), 'r')
+assert reconstruct(example1) == expr.Call(expr.Global('f'), [expr.Call(expr.Global('g'), [expr.Arg('x')])])
+assert reconstruct(example2) == expr.GetAttr(expr.Arg('x'), 'r')
