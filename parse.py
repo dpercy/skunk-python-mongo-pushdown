@@ -36,15 +36,21 @@ def compile_function_to_expr(func):
     bindings_dict = inspect.getcallargs(func, 'DOCUMENT')
     [arg_name] = bindings_dict.keys()
 
-    statements = code_to_ast(func.func_code).body
-    return compile_statements_to_expr(statements, {
-        arg_name: '$$CURRENT',
-    })
+    assert len(func.func_code.co_freevars) == 0, "Can't handle closures yet: {}".format(func)
+    assert len(func.func_code.co_cellvars) == 0, "Can't handle closures yet: {}".format(func)
 
-def compile_statements_to_expr(nodes, env):
+    statements = code_to_ast(func.func_code).body
+    env = {
+        arg_name: '$$CURRENT',
+    }
+    globals = func.func_globals
+    return compile_statements_to_expr(statements, env, globals)
+
+def compile_statements_to_expr(nodes, env, globals):
     '''
     nodes: List[ast.Node]
     env: Dict[string -> AggExpr]
+    globals: Dict[string -> PythonValue]
     '''
     if len(nodes) == 0:
         return {'$literal': None}
@@ -53,13 +59,13 @@ def compile_statements_to_expr(nodes, env):
     nodes = nodes[1:]
 
     if isinstance(node, ast.Return):
-        return compile_expr_to_expr(node.value, env)
+        return compile_expr_to_expr(node.value, env, globals)
     elif isinstance(node, ast.If):
-        agg_if = compile_expr_to_expr(node.test, env)
+        agg_if = compile_expr_to_expr(node.test, env, globals)
         # Append the statements outside the If to both branches of the If.
         # That's a simple way to handle fallthrough.
-        agg_then = compile_statements_to_expr(node.body + nodes, env)
-        agg_else = compile_statements_to_expr(node.orelse + nodes, env)
+        agg_then = compile_statements_to_expr(node.body + nodes, env, globals)
+        agg_else = compile_statements_to_expr(node.orelse + nodes, env, globals)
         return {'$cond': {
             '$if': agg_if,
             '$then': agg_then,
@@ -69,7 +75,10 @@ def compile_statements_to_expr(nodes, env):
         raise TypeError('unhandled Stmt node type: {}'.format(node))
 
 
-def compile_expr_to_expr(node, env):
+def compile_expr_to_expr(node, env, globals):
+    def recur(node):
+        return compile_expr_to_expr(node, env, globals)
+
     if isinstance(node, ast.Name):
         if node.id in env:
             return env[node.id]
@@ -79,7 +88,7 @@ def compile_expr_to_expr(node, env):
             raise ValueError('unhandled global variable {}'.format(node.id))
     elif isinstance(node, ast.BoolOp):
         if isinstance(node.op, ast.And):
-            return {'$and': [compile_expr_to_expr(n, env) for n in node.values]}
+            return {'$and': [recur(n) for n in node.values]}
         else:
             raise TypeError('unhandled BoolOp op type: {}'.format(node.op))
     elif isinstance(node, ast.Compare):
@@ -93,19 +102,46 @@ def compile_expr_to_expr(node, env):
             agg_op = '$eq'
         else:
             raise ValueError('unhandled Compare op {}'.format(op))
-        return { agg_op: [ compile_expr_to_expr(left, env),
-                           compile_expr_to_expr(right, env) ]}
+        return { agg_op: [ recur(left), recur(right) ]}
     elif isinstance(node, ast.Attribute):
-        agg_doc = compile_expr_to_expr(node.value, env)
+        agg_doc = recur(node.value)
         # If we're trying to dereference an agg variable or path,
         # we just append ".fieldname" to it.
         if isinstance(agg_doc, basestring):
             assert agg_doc[0] == '$', 'Field paths must start with "$": {}'.format(agg_doc)
             return agg_doc + '.' + node.attr
         else:
-            # Otherwise, we have to do something else.
-            # Maybe use $let to bind the expression to a variable.
-            raise TypeError("Can't dereference this thing; it's not a field-path: {}".format(agg_doc))
+            # If the expression isn't a field path, we have to use $let
+            # to bind it to a variable so we can dereference it.
+            return {'$let': {'vars': {'x': agg_doc}, 'in': '$$x.' + node.attr}}
+    elif isinstance(node, ast.Call):
+        assert isinstance(node.func, ast.Name), "Can't handle calls to function expressions yet"
+        func_name = node.func.id
+        # Try to look up the function
+        if func_name in env:
+            raise ValueError("Can't handle non-global functions yet")
+        elif func_name in globals:
+            func_value = globals[func_name]
+
+            # Try to inline the function!
+            # - match up arguments with paramters
+            assert node.starargs is None, "unhandled starargs"
+            assert node.kwargs is None, "unhandled kwargs"
+            arg_expr_dict = inspect.getcallargs(func_value, *node.args)
+            # - compile each argument
+            arg_agg_dict = { name: compile_expr_to_expr(e, env, globals)
+                             for name, e in arg_expr_dict.items() }
+            # - compile the function body
+            body_env = { name: "$$" + name
+                         for name in arg_expr_dict }
+            body = compile_statements_to_expr(code_to_ast(func_value.func_code).body, body_env, func_value.func_globals)
+            # - wrap the result in a $let
+            return {'$let': {
+                'vars': arg_agg_dict,
+                'in': body
+            }}
+        else:
+            raise TypeError('unbound function name (maybe a problem with import order?): {}'.format(func_name))
     else:
         raise TypeError('unhandled Expr node type: {}'.format(node))
 
@@ -135,3 +171,23 @@ assert compile_function_to_expr(get_draft_or_public) == \
         '$then': "$$CURRENT.draft",
         '$else': "$$CURRENT.public",
     }}
+
+def get_latest_name(profile):
+    return get_draft_or_public(profile).first_name
+
+assert compile_function_to_expr(get_latest_name) == \
+    {'$let': {
+        'vars': {
+            'x':
+                {'$let': {
+                    'vars': {'profile': "$$CURRENT"},
+                    'in':
+                        {'$cond': {
+                            '$if': {'$neq': ["$$profile.draft", None]},
+                            '$then': "$$profile.draft",
+                            '$else': "$$profile.public",
+                        }}}}
+        },
+        'in': "$$x.first_name"
+    }}
+
