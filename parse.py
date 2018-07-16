@@ -102,7 +102,17 @@ def compile_expr_to_expr(node, env, globals):
             agg_op = '$eq'
         else:
             raise ValueError('unhandled Compare op {}'.format(op))
-        return { agg_op: [ recur(left), recur(right) ]}
+
+
+        # When doing equality checks, consider missing fields and null fields to be equal.
+        # This is weird, but similar to what MongoEngine does.
+        # Maybe this is incompatible with the PyMODM way of doing things.
+        def _convert_missing_null(e):
+            if e is None:
+                return e
+            return {'$ifNull': [e, None]}
+        return { agg_op: [ _convert_missing_null(recur(left)),
+                           _convert_missing_null(recur(right)) ]}
     elif isinstance(node, ast.Attribute):
         agg_doc = recur(node.value)
         # If we're trying to dereference an agg variable or path,
@@ -153,8 +163,8 @@ def is_pending_retirement(doc):
         and doc.retirement.retired is None)
 
 assert compile_function_to_expr(is_pending_retirement) == \
-    {'$and': [ {'$ne': ["$$CURRENT.retirement", None]},
-               {'$eq':  ["$$CURRENT.retirement.retired", None]} ]}
+    {'$and': [ {'$ne': [{'$ifNull': ["$$CURRENT.retirement", None]}, None]},
+               {'$eq': [{'$ifNull': ["$$CURRENT.retirement.retired", None]}, None]} ]}
 
 
 def get_draft_or_public(profile):
@@ -167,7 +177,7 @@ def get_draft_or_public(profile):
 
 assert compile_function_to_expr(get_draft_or_public) == \
     {'$cond': {
-        'if': {'$ne': ["$$CURRENT.draft", None]},
+        'if': {'$ne': [{'$ifNull': ["$$CURRENT.draft", None]}, None]},
         'then': "$$CURRENT.draft",
         'else': "$$CURRENT.public",
     }}
@@ -183,7 +193,7 @@ assert compile_function_to_expr(get_latest_name) == \
                     'vars': {'profile': "$$CURRENT"},
                     'in':
                         {'$cond': {
-                            'if': {'$ne': ["$$profile.draft", None]},
+                            'if': {'$ne': [{'$ifNull': ["$$profile.draft", None]}, None]},
                             'then': "$$profile.draft",
                             'else': "$$profile.public",
                         }}}}
@@ -192,7 +202,7 @@ assert compile_function_to_expr(get_latest_name) == \
     }}
 
 
-## TODO problem with {$eq None} / {$ne None} doesn't consider missing fields to be none
-##  solution:
-##    - use square brackets instead of fields
-##    - use 'not in' operator to check nullness
+## TODO wrap this up in a nice coll.query(lambda docs: ...) kind of interface
+
+
+## TODO seek out some really hairy examples (John or Graham's PR; Nathan)
