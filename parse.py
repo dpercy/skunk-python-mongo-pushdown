@@ -50,8 +50,21 @@ def compile_statements_to_expr(nodes, env):
         return {'$literal': None}
 
     node = nodes[0]
+    nodes = nodes[1:]
+
     if isinstance(node, ast.Return):
         return compile_expr_to_expr(node.value, env)
+    elif isinstance(node, ast.If):
+        agg_if = compile_expr_to_expr(node.test, env)
+        # Append the statements outside the If to both branches of the If.
+        # That's a simple way to handle fallthrough.
+        agg_then = compile_statements_to_expr(node.body + nodes, env)
+        agg_else = compile_statements_to_expr(node.orelse + nodes, env)
+        return {'$cond': {
+            '$if': agg_if,
+            '$then': agg_then,
+            '$else': agg_else,
+        }}
     else:
         raise TypeError('unhandled Stmt node type: {}'.format(node))
 
@@ -106,3 +119,19 @@ def is_pending_retirement(doc):
 assert compile_function_to_expr(is_pending_retirement) == \
     {'$and': [ {'$neq': ["$$CURRENT.retirement", None]},
                {'$eq':  ["$$CURRENT.retirement.retired", None]} ]}
+
+
+def get_draft_or_public(profile):
+    if profile.draft is not None:
+        return profile.draft
+    else:
+        return profile.public
+
+    assert False, 'unreachable'
+
+assert compile_function_to_expr(get_draft_or_public) == \
+    {'$cond': {
+        '$if': {'$neq': ["$$CURRENT.draft", None]},
+        '$then': "$$CURRENT.draft",
+        '$else': "$$CURRENT.public",
+    }}
