@@ -67,9 +67,9 @@ def compile_statements_to_expr(nodes, env, globals):
         agg_then = compile_statements_to_expr(node.body + nodes, env, globals)
         agg_else = compile_statements_to_expr(node.orelse + nodes, env, globals)
         return {'$cond': {
-            '$if': agg_if,
-            '$then': agg_then,
-            '$else': agg_else,
+            'if': agg_if,
+            'then': agg_then,
+            'else': agg_else,
         }}
     else:
         raise TypeError('unhandled Stmt node type: {}'.format(node))
@@ -97,7 +97,7 @@ def compile_expr_to_expr(node, env, globals):
         [op] = node.ops
         [right] = node.comparators
         if isinstance(op, ast.IsNot):
-            agg_op = '$neq'
+            agg_op = '$ne'
         elif isinstance(op, ast.Is):
             agg_op = '$eq'
         else:
@@ -153,7 +153,7 @@ def is_pending_retirement(doc):
         and doc.retirement.retired is None)
 
 assert compile_function_to_expr(is_pending_retirement) == \
-    {'$and': [ {'$neq': ["$$CURRENT.retirement", None]},
+    {'$and': [ {'$ne': ["$$CURRENT.retirement", None]},
                {'$eq':  ["$$CURRENT.retirement.retired", None]} ]}
 
 
@@ -167,9 +167,9 @@ def get_draft_or_public(profile):
 
 assert compile_function_to_expr(get_draft_or_public) == \
     {'$cond': {
-        '$if': {'$neq': ["$$CURRENT.draft", None]},
-        '$then': "$$CURRENT.draft",
-        '$else': "$$CURRENT.public",
+        'if': {'$ne': ["$$CURRENT.draft", None]},
+        'then': "$$CURRENT.draft",
+        'else': "$$CURRENT.public",
     }}
 
 def get_latest_name(profile):
@@ -183,11 +183,16 @@ assert compile_function_to_expr(get_latest_name) == \
                     'vars': {'profile': "$$CURRENT"},
                     'in':
                         {'$cond': {
-                            '$if': {'$neq': ["$$profile.draft", None]},
-                            '$then': "$$profile.draft",
-                            '$else': "$$profile.public",
+                            'if': {'$ne': ["$$profile.draft", None]},
+                            'then': "$$profile.draft",
+                            'else': "$$profile.public",
                         }}}}
         },
         'in': "$$x.first_name"
     }}
 
+
+## TODO problem with {$eq None} / {$ne None} doesn't consider missing fields to be none
+##  solution:
+##    - use square brackets instead of fields
+##    - use 'not in' operator to check nullness
