@@ -238,7 +238,12 @@ def compile_expr_to_pipeline(node, collection_variable, globals):
         raise TypeError('unhandled Expr node type: {}'.format(node))
 
 
+def query(collection, func):
+    return collection.aggregate(compile_function_to_pipeline(func))
 
+def explain(collection, func):
+    pipeline = compile_function_to_pipeline(func)
+    return collection.database.command('aggregate', collection.name, pipeline=pipeline, explain=True)
 
 ##### examples
 
@@ -286,8 +291,6 @@ assert compile_function_to_expr(get_latest_name) == \
     }}
 
 
-## TODO support functions that operate on whole collections
-
 thing = compile_function_to_pipeline(lambda docs:
             [ doc for doc in docs
               if doc.x > 3 ])
@@ -304,8 +307,6 @@ assert compile_function_to_pipeline(lambda docs: [ doc.x for doc in docs ]) == [
 assert compile_function_to_pipeline(lambda docs: [ {'foo': doc.x} for doc in docs ]) == [
     {'$replaceRoot': {'newRoot': {'foo': "$$CURRENT.x"}}},
 ]
-
-## TODO wrap this up in a nice coll.query(lambda docs: ...) kind of interface
 
 
 ## TODO seek out some really hairy examples (John or Graham's PR; Nathan)
