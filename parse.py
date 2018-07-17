@@ -96,13 +96,18 @@ def compile_expr_to_expr(node, env, globals):
         left = node.left
         [op] = node.ops
         [right] = node.comparators
-        if isinstance(op, ast.IsNot):
-            agg_op = '$ne'
-        elif isinstance(op, ast.Is):
-            agg_op = '$eq'
+        COMPARE_OPS = {
+            ast.IsNot: '$ne',
+            ast.Is: '$eq',
+            ast.Gt: '$gt',
+            ast.Lt: '$lt',
+            ast.GtE: '$gte',
+            ast.LtE: '$lte',
+        }
+        if type(op) in COMPARE_OPS:
+            agg_op = COMPARE_OPS[type(op)]
         else:
             raise ValueError('unhandled Compare op {}'.format(op))
-
 
         # When doing equality checks, consider missing fields and null fields to be equal.
         # This is weird, but similar to what MongoEngine does.
@@ -152,8 +157,72 @@ def compile_expr_to_expr(node, env, globals):
             }}
         else:
             raise TypeError('unbound function name (maybe a problem with import order?): {}'.format(func_name))
+    elif isinstance(node, ast.Num):
+        return node.n
     else:
         raise TypeError('unhandled Expr node type: {}'.format(node))
+
+
+def compile_function_to_pipeline(func):
+    '''
+    func: List[BSON] -> List[BSON]
+    return: agg pipeline
+    '''
+    bindings_dict = inspect.getcallargs(func, 'COLLECTION')
+    [arg_name] = bindings_dict.keys()
+    assert len(func.func_code.co_freevars) == 0, "Can't handle closures yet"
+    assert len(func.func_code.co_cellvars) == 0, "Can't handle closures yet"
+
+    statements = code_to_ast(func.func_code).body
+    return compile_statements_to_pipeline(statements, arg_name)
+
+def compile_statements_to_pipeline(nodes, collection_variable):
+    '''
+    collection_variable is the name of the local variable that
+    represents the input to the agg pipeline.
+    '''
+    if len(nodes) == 0:
+        # If the Python function returns None, we can't
+        # compile it to an agg pipeline, because agg pipelines
+        # always return a stream of documents.
+        raise TypeError('agg pipeline function must return a value')
+
+    node = nodes[0]
+    nodes = nodes[1:]
+    if isinstance(node, ast.Return):
+        return compile_expr_to_pipeline(node.value, collection_variable, globals)
+    else:
+        raise TypeError('unhandled Stmt node type: {}'.format(node))
+
+def compile_expr_to_pipeline(node, collection_variable, globals):
+    if isinstance(node, ast.Name) and node.id == collection_variable:
+        return []
+    elif isinstance(node, ast.ListComp):
+        # list comprehensions have:
+        # - a sequence of "generators", each with
+        #     - an "iter" expr
+        #     - a sequence of "ifs" exprs
+        #     - a "target" for assignment
+        # - an "elt" expression
+        # Is the comprehension filter-like?  [ doc for doc in docs if condition ]
+        if len(node.generators) == 1 \
+                and isinstance(node.generators[0].iter, ast.Name) \
+                and node.generators[0].iter.id == collection_variable \
+                and isinstance(node.elt, ast.Name) \
+                and isinstance(node.generators[0].target, ast.Name) \
+                and node.elt.id == node.generators[0].target.id:
+            doc_variable = node.generators[0].target.id
+            checks = node.generators[0].ifs
+            return [{'$filter': {'$expr': {'$and': [
+                compile_expr_to_expr(check, { doc_variable: "$$CURRENT" }, globals)
+                for check in checks
+            ]}}}]
+        else:
+            raise ValueError('unhandled list comprehension: {}'.format(node))
+    else:
+        raise TypeError('unhandled Expr node type: {}'.format(node))
+
+
 
 
 ##### examples
@@ -202,7 +271,26 @@ assert compile_function_to_expr(get_latest_name) == \
     }}
 
 
+## TODO support functions that operate on whole collections
+
+thing = compile_function_to_pipeline(lambda docs:
+            [ doc for doc in docs
+              if doc.x > 3 ])
+assert thing == [
+        {'$filter': { '$expr':
+            {'$and': [
+                {'$gt': [{'$ifNull': ["$$CURRENT.x", None]},
+                         {'$ifNull': [3, None]}]}
+            ]}
+        }},
+    ]
+
 ## TODO wrap this up in a nice coll.query(lambda docs: ...) kind of interface
 
 
 ## TODO seek out some really hairy examples (John or Graham's PR; Nathan)
+# - but this project shines more when some Python logic is duplicated into a query
+# get_num_certified converted to get_num_certified_by_quarter
+#   https://github.com/10gen/mitx/commit/502f908ffc#diff-7cb5c0ad755eab9c85042b2fc732e3b4R2724
+# get_graded_problems looks interesting
+# get_registration_order_and_offering is tricky because of lookup
