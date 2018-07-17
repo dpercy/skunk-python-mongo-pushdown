@@ -159,6 +159,15 @@ def compile_expr_to_expr(node, env, globals):
             raise TypeError('unbound function name (maybe a problem with import order?): {}'.format(func_name))
     elif isinstance(node, ast.Num):
         return node.n
+    elif isinstance(node, ast.Dict):
+        if not all(isinstance(k, ast.Str) for k in node.keys):
+            raise TypeError('each key in a dict expression must be a string literal')
+        if any(k.s.startswith('$') for k in node.keys):
+            raise TypeError('keys in a dict expression may not start with "$"')
+        return {
+            k.s: compile_expr_to_expr(v, env, globals)
+            for k, v in zip(node.keys, node.values)
+        }
     else:
         raise TypeError('unhandled Expr node type: {}'.format(node))
 
@@ -204,19 +213,25 @@ def compile_expr_to_pipeline(node, collection_variable, globals):
         #     - a sequence of "ifs" exprs
         #     - a "target" for assignment
         # - an "elt" expression
-        # Is the comprehension filter-like?  [ doc for doc in docs if condition ]
+
+        # Is the comprehension map-and-filter-like?  [ expr for doc in pipeline if condition ... ]
         if len(node.generators) == 1 \
-                and isinstance(node.generators[0].iter, ast.Name) \
-                and node.generators[0].iter.id == collection_variable \
-                and isinstance(node.elt, ast.Name) \
-                and isinstance(node.generators[0].target, ast.Name) \
-                and node.elt.id == node.generators[0].target.id:
-            doc_variable = node.generators[0].target.id
-            checks = node.generators[0].ifs
-            return [{'$filter': {'$expr': {'$and': [
-                compile_expr_to_expr(check, { doc_variable: "$$CURRENT" }, globals)
-                for check in checks
-            ]}}}]
+                and isinstance(node.generators[0].target, ast.Name):
+
+            previous_stages = compile_expr_to_pipeline(node.generators[0].iter, collection_variable, globals)
+            doc_var = node.generators[0].target.id
+            env = { node.generators[0].target.id: "$$CURRENT" }
+            filters = [
+                {'$filter': {'$expr': compile_expr_to_expr(check, env, globals) } }
+                for check in node.generators[0].ifs
+            ]
+            if isinstance(node.elt, ast.Name) and node.elt.id == doc_var:
+                projection = []
+            else:
+                projection = [
+                    {'$replaceRoot': {'newRoot': compile_expr_to_expr(node.elt, env, globals) }}
+                ]
+            return previous_stages + filters + projection
         else:
             raise ValueError('unhandled list comprehension: {}'.format(node))
     else:
@@ -278,12 +293,17 @@ thing = compile_function_to_pipeline(lambda docs:
               if doc.x > 3 ])
 assert thing == [
         {'$filter': { '$expr':
-            {'$and': [
-                {'$gt': [{'$ifNull': ["$$CURRENT.x", None]},
-                         {'$ifNull': [3, None]}]}
-            ]}
+            {'$gt': [{'$ifNull': ["$$CURRENT.x", None]},
+                     {'$ifNull': [3, None]}]}
         }},
     ]
+
+assert compile_function_to_pipeline(lambda docs: [ doc.x for doc in docs ]) == [
+    {'$replaceRoot': {'newRoot': "$$CURRENT.x"}},
+]
+assert compile_function_to_pipeline(lambda docs: [ {'foo': doc.x} for doc in docs ]) == [
+    {'$replaceRoot': {'newRoot': {'foo': "$$CURRENT.x"}}},
+]
 
 ## TODO wrap this up in a nice coll.query(lambda docs: ...) kind of interface
 
