@@ -76,12 +76,16 @@ def compile_statements_to_expr(nodes, env, globals):
 
 
 def compile_expr_to_expr(node, env, globals):
+    assert isinstance(globals, dict)
+
     def recur(node):
         return compile_expr_to_expr(node, env, globals)
 
     if isinstance(node, ast.Name):
         if node.id in env:
             return env[node.id]
+        elif node.id in globals:
+            return compile_value_to_expr(globals[node.id])
         elif node.id == 'None':
             return None
         else:
@@ -103,6 +107,10 @@ def compile_expr_to_expr(node, env, globals):
             ast.Lt: '$lt',
             ast.GtE: '$gte',
             ast.LtE: '$lte',
+            ast.In: '$in',
+
+            # TODO figure out proper equality
+            ast.Eq: '$eq',
         }
         if type(op) in COMPARE_OPS:
             agg_op = COMPARE_OPS[type(op)]
@@ -118,6 +126,16 @@ def compile_expr_to_expr(node, env, globals):
             return {'$ifNull': [e, None]}
         return { agg_op: [ _convert_missing_null(recur(left)),
                            _convert_missing_null(recur(right)) ]}
+    elif isinstance(node, ast.BinOp):
+        BIN_OPS = {
+            ast.Add: '$add',
+            ast.Sub: '$subtract',
+        }
+        if type(node.op) in BIN_OPS:
+            agg_op = BIN_OPS[type(node.op)]
+        else:
+            raise ValueError('unhandled binop: {}'.format(node.op))
+        return { agg_op: [ recur(node.left), recur(node.right) ] }
     elif isinstance(node, ast.Attribute):
         agg_doc = recur(node.value)
         # If we're trying to dereference an agg variable or path,
@@ -155,6 +173,9 @@ def compile_expr_to_expr(node, env, globals):
                 'vars': arg_agg_dict,
                 'in': body
             }}
+        elif func_name == 'len':
+            # TODO assert exactly 1 arg, no kwargs, etc
+            return {'$size': recur(node.args[0]) }
         else:
             raise TypeError('unbound function name (maybe a problem with import order?): {}'.format(func_name))
     elif isinstance(node, ast.Num):
@@ -168,8 +189,72 @@ def compile_expr_to_expr(node, env, globals):
             k.s: compile_expr_to_expr(v, env, globals)
             for k, v in zip(node.keys, node.values)
         }
+    elif isinstance(node, ast.ListComp):
+        if len(node.generators) > 1:
+            # [ elt for target0 in iter0 for target in iter ... ]
+            # ->
+            # $concatArrays([ [ elt for target in iter ... ]
+            #                 for target0 in iter0 ])
+            gen0 = node.generators[0]
+            gen_rest = node.generators[1:]
+            transformed_expr = ast.ListComp(
+                elt=ast.ListComp(
+                    elt=node.elt,
+                    generators=gen_rest,
+                ),
+                generators=[gen0]
+            )
+            return {'$reduce': {
+                'input': recur(transformed_expr),
+                'initialValue': [],
+                'in': { '$concatArrays': [ "$$value", "$$this" ] },
+            }}
+        elif len(node.generators) == 1:
+            # [ elt for target in iter if test if test ... ]
+            g = node.generators[0]
+            elt = node.elt
+            target = g.target
+            iter = g.iter
+            tests = g.ifs
+
+            if not isinstance(target, ast.Name):
+                raise ValueError("Can't do destructuring assignment in list comprehension")
+
+            expr = recur(iter)
+            new_env = dict(env, **{target.id: "$$" + target.id})
+            for test in tests:
+                expr = {'$filter': { 'input': expr,
+                                     'as': target.id,
+                                     'cond': compile_expr_to_expr(test, new_env, globals) }}
+            if isinstance(elt, ast.Name) and elt.id == target.id:
+                # Don't emit $map for things like [ x for x in stuff ]
+                pass
+            else:
+                expr = {'$map': { 'input': expr,
+                                  'as': target.id,
+                                  'in': compile_expr_to_expr(elt, new_env, globals) }}
+            return expr
+        else:
+            raise ValueError('unhandled ListComp: {}'.format(node))
+    elif isinstance(node, ast.Tuple):
+        return map(recur, node.elts)
+    elif isinstance(node, ast.Str):
+        return {'$literal': node.s}
+    elif isinstance(node, ast.Subscript):
+        assert isinstance(node.slice, ast.Index), "Can't handle slices yet"
+        return {'$arrayElemAt': [ recur(node.value), recur(node.slice.value) ]}
     else:
+        import ipdb; ipdb.set_trace()
         raise TypeError('unhandled Expr node type: {}'.format(node))
+
+
+def compile_value_to_expr(value):
+    '''
+    Compile a Python value to an agg expression that returns that value.
+    '''
+    if isinstance(value, basestring):
+        return value
+    assert False, 'TODO handle this value {}'.format(repr(value))
 
 
 def compile_function_to_pipeline(func):
@@ -179,13 +264,20 @@ def compile_function_to_pipeline(func):
     '''
     bindings_dict = inspect.getcallargs(func, 'COLLECTION')
     [arg_name] = bindings_dict.keys()
-    assert len(func.func_code.co_freevars) == 0, "Can't handle closures yet"
-    assert len(func.func_code.co_cellvars) == 0, "Can't handle closures yet"
+
+    assert len(func.func_code.co_cellvars) == 0, "Can't handle cellvars yet"
+
+    closure_var_names = func.func_code.co_freevars
+    closure_var_values = [ cell.cell_contents for cell in (func.func_closure or ()) ]
+
+    globals = dict(func.func_globals)
+    for name, val in zip(closure_var_names, closure_var_values):
+        globals[name] = val
 
     statements = code_to_ast(func.func_code).body
-    return compile_statements_to_pipeline(statements, arg_name)
+    return compile_statements_to_pipeline(statements, arg_name, globals)
 
-def compile_statements_to_pipeline(nodes, collection_variable):
+def compile_statements_to_pipeline(nodes, collection_variable, globals):
     '''
     collection_variable is the name of the local variable that
     represents the input to the agg pipeline.
@@ -222,7 +314,7 @@ def compile_expr_to_pipeline(node, collection_variable, globals):
             doc_var = node.generators[0].target.id
             env = { node.generators[0].target.id: "$$CURRENT" }
             filters = [
-                {'$filter': {'$expr': compile_expr_to_expr(check, env, globals) } }
+                {'$match': {'$expr': compile_expr_to_expr(check, env, globals) } }
                 for check in node.generators[0].ifs
             ]
             if isinstance(node.elt, ast.Name) and node.elt.id == doc_var:
@@ -232,6 +324,33 @@ def compile_expr_to_pipeline(node, collection_variable, globals):
                     {'$replaceRoot': {'newRoot': compile_expr_to_expr(node.elt, env, globals) }}
                 ]
             return previous_stages + filters + projection
+        # Does the comprehension have multiple 'for' statements?
+        # Then convert it to two comprehensions with a flatten.
+        # https://ncatlab.org/nlab/files/WadlerMonads.pdf section 2.2, rule 3
+        elif len(node.generators) > 1:
+            assert False, "TODO"
+            '''
+            '''
+            # [ elt for target0 in iter0 for target in iter ... ]
+            # ->
+            # $concatArrays([ [ elt for target in iter ... ]
+            #                 for target0 in iter0 ])
+            # [ elt for target in iter ... ]
+
+            gen0 = node.generators[0]
+            gen_rest = node.generators[1:]
+            transformed_expr = ast.ListComp(
+                elt=ast.ListComp(
+                    elt=node.elt,
+                    generators=gen_rest,
+                ),
+                generators=[gen0]
+            )
+            return {'$reduce': {
+                'input': recur(transformed_expr),
+                'initialValue': [],
+                'in': { '$concatArrays': [ "$$value", "$$this" ] },
+            }}
         else:
             raise ValueError('unhandled list comprehension: {}'.format(node))
     else:
@@ -295,7 +414,7 @@ thing = compile_function_to_pipeline(lambda docs:
             [ doc for doc in docs
               if doc.x > 3 ])
 assert thing == [
-        {'$filter': { '$expr':
+        {'$match': { '$expr':
             {'$gt': [{'$ifNull': ["$$CURRENT.x", None]},
                      {'$ifNull': [3, None]}]}
         }},
@@ -315,3 +434,59 @@ assert compile_function_to_pipeline(lambda docs: [ {'foo': doc.x} for doc in doc
 #   https://github.com/10gen/mitx/commit/502f908ffc#diff-7cb5c0ad755eab9c85042b2fc732e3b4R2724
 # get_graded_problems looks interesting
 # get_registration_order_and_offering is tricky because of lookup
+#
+
+
+# TODO support methods? requires integrating with the ODM?
+# OR you could just say "everything in this collection has methods drawn from this class..."
+# OR the class itself could be the queryable thing
+
+
+# more examples
+
+def is_lesson_graded(lesson):
+    return lesson.grade_format in ('Homework', 'Final')
+
+def offering_graded_problems(offering):
+    return [
+        lesson.problem
+        for chapter in offering.chapters
+        for lesson in chapter.lessons
+        if is_lesson_graded(lesson)
+    ]
+
+
+# query(hg_offering, lambda docs: offering_graded_problems(doc) for doc in docs if doc._id == 'thing')
+# TODO what the heck is printing??
+thing = compile_function_to_expr(offering_graded_problems)
+
+
+# demo with data
+
+import pymongo
+conn = pymongo.MongoClient()
+hg_offering = conn.mercury.hg_offering
+
+cur = query(hg_offering, lambda docs: [
+    {'allProblems': offering_graded_problems(doc)}
+    for doc in docs
+])
+for doc in cur:
+    assert type(doc) == dict
+    assert type(doc['allProblems']) == list
+    for problem in doc['allProblems']:
+        assert type(problem) == dict
+
+def get_graded_problems(offering_id):
+    return query(hg_offering, lambda docs: [
+        problem
+        for offering in docs
+        if offering._id == offering_id
+        for problem in offering_graded_problems(offering)
+    ])
+
+##v = get_graded_problems('M121/2017_October')
+cur = query(hg_offering, lambda docs: [
+    { 'lastTitle': doc.chapters[len(doc.chapters)-1].title }
+    for doc in docs
+])
